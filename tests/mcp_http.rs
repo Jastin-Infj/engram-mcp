@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, net::SocketAddr};
+use std::{collections::BTreeSet, net::SocketAddr, path::Path};
 
 use axum::{
     Router,
@@ -6,17 +6,19 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use engram_mcp::{
-    config::{Config, OAuthConfig, ScopeDirectories},
+    config::{Config, InboxConfig, OAuthConfig, ScopeDirectories},
     http,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-fn app(rate_limit_burst: u32) -> (TempDir, Router) {
-    let root = TempDir::new().unwrap();
+const INBOX: &str = "99_inbox";
+
+fn config(root: &TempDir, rate_limit_burst: u32) -> Config {
     std::fs::create_dir_all(root.path().join("10_tech/rust")).unwrap();
     std::fs::create_dir_all(root.path().join("90_private")).unwrap();
+    std::fs::create_dir_all(root.path().join(INBOX)).unwrap();
     std::fs::write(root.path().join("INDEX.md"), "# Engram\n").unwrap();
     std::fs::write(
         root.path().join("10_tech/rust/needle.md"),
@@ -29,7 +31,7 @@ fn app(rate_limit_burst: u32) -> (TempDir, Router) {
     )
     .unwrap();
 
-    let config = Config {
+    Config {
         kb_root: root.path().to_path_buf(),
         scope_directories: ScopeDirectories::default(),
         key_a: "tech-secret".into(),
@@ -52,8 +54,48 @@ fn app(rate_limit_burst: u32) -> (TempDir, Router) {
             refresh_state_dir: root.path().join("oauth-state"),
             refresh_token_ttl_seconds: 60,
         },
-    };
+        // The inbox lives inside the knowledge base here exactly as it does in
+        // production, so the "written notes stay invisible to search and fetch"
+        // tests are meaningful rather than an artifact of the fixture.
+        inbox: Some(InboxConfig {
+            root: root.path().join(INBOX),
+            writes_per_hour: 10,
+            max_note_bytes: 32_768,
+            max_total_bytes: 8_388_608,
+        }),
+    }
+}
+
+fn app(rate_limit_burst: u32) -> (TempDir, Router) {
+    app_with(rate_limit_burst, |_| {})
+}
+
+fn app_with(rate_limit_burst: u32, adjust: impl FnOnce(&mut Config)) -> (TempDir, Router) {
+    let root = TempDir::new().unwrap();
+    let mut config = config(&root, rate_limit_burst);
+    adjust(&mut config);
     (root, http::router(&config).unwrap())
+}
+
+fn inbox_files(root: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(root.join(INBOX))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn append(title: &str, body: &str, api_key: &str) -> Request<Body> {
+    request(
+        "tools/call",
+        json!({
+            "name": "append_note",
+            "arguments": {"title": title, "body": body},
+            "_meta": request_meta(),
+        }),
+        Some(api_key),
+    )
 }
 
 fn request(method: &str, params: Value, api_key: Option<&str>) -> Request<Body> {
@@ -126,7 +168,7 @@ async fn health_is_private_and_missing_key_is_unauthorized() {
 }
 
 #[tokio::test]
-async fn lists_only_search_then_fetch_with_read_only_annotations() {
+async fn tech_scope_lists_only_search_then_fetch_with_read_only_annotations() {
     let (_root, app) = app(10);
     let response = app
         .oneshot(request(
@@ -146,6 +188,211 @@ async fn lists_only_search_then_fetch_with_read_only_annotations() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["annotations"]["destructiveHint"], false);
         assert_eq!(tool["annotations"]["openWorldHint"], false);
+    }
+}
+
+#[tokio::test]
+async fn only_the_private_scope_is_offered_append_note() {
+    let (_root, app) = app(10);
+    let private = json_body(
+        app.oneshot(request(
+            "tools/list",
+            json!({"_meta": request_meta()}),
+            Some("private-secret"),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let tools = private["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[2]["name"], "append_note");
+    assert_eq!(tools[2]["annotations"]["readOnlyHint"], false);
+    assert_eq!(tools[2]["annotations"]["destructiveHint"], false);
+    assert_eq!(tools[2]["annotations"]["idempotentHint"], false);
+    assert_eq!(tools[2]["annotations"]["openWorldHint"], false);
+    // The client supplies content, never a location.
+    let properties = &tools[2]["inputSchema"]["properties"];
+    assert!(properties["title"].is_object());
+    assert!(properties["body"].is_object());
+    assert_eq!(properties.as_object().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn tech_scope_cannot_call_append_note_or_learn_that_it_exists() {
+    let (root, app) = app(10);
+    let denied = json_body(
+        app.clone()
+            .oneshot(append("Tech note", "body", "tech-secret"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(denied["error"]["code"], -32602);
+    assert_eq!(denied["error"]["message"], "tool not found");
+
+    // Schema validation must not reveal a hidden tool.
+    let malformed = json_body(
+        app.clone()
+            .oneshot(request(
+                "tools/call",
+                json!({
+                    "name": "append_note",
+                    "arguments": {"unexpected": 1},
+                    "_meta": request_meta(),
+                }),
+                Some("tech-secret"),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(malformed["error"]["message"], "tool not found");
+
+    let absent = json_body(
+        app.oneshot(request(
+            "tools/call",
+            json!({"name": "write_file", "arguments": {}, "_meta": request_meta()}),
+            Some("tech-secret"),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(absent["error"], denied["error"]);
+    assert!(inbox_files(root.path()).is_empty());
+}
+
+#[tokio::test]
+async fn append_note_stores_a_server_named_markdown_file() {
+    let (root, app) = app(10);
+    let body = json_body(
+        app.oneshot(append(
+            "Rust Ownership Notes",
+            "unique-inbox-term in the body",
+            "private-secret",
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let result = &body["result"]["structuredContent"];
+    let id = result["id"].as_str().unwrap();
+    assert!(id.starts_with("99_inbox/"));
+    assert!(id.ends_with("-rust-ownership-notes.md"));
+
+    let names = inbox_files(root.path());
+    assert_eq!(names.len(), 1);
+    assert_eq!(format!("99_inbox/{}", names[0]), id);
+
+    let stored = std::fs::read_to_string(root.path().join(INBOX).join(&names[0])).unwrap();
+    assert!(stored.starts_with("---\ntitle: Rust Ownership Notes\n"));
+    assert!(stored.contains("source: mcp:append_note"));
+    assert!(stored.contains(&format!("created: {}", result["created"].as_str().unwrap())));
+    assert!(stored.ends_with("unique-inbox-term in the body\n"));
+    assert_eq!(result["bytes"].as_u64().unwrap(), stored.len() as u64);
+}
+
+#[tokio::test]
+async fn an_appended_note_stays_out_of_search_and_fetch() {
+    let (_root, app) = app(20);
+    let created = json_body(
+        app.clone()
+            .oneshot(append("Hidden Note", "unique-inbox-term", "private-secret"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = created["result"]["structuredContent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let searched = json_body(
+        app.clone()
+            .oneshot(request(
+                "tools/call",
+                json!({
+                    "name": "search",
+                    "arguments": {"query": "unique-inbox-term"},
+                    "_meta": request_meta(),
+                }),
+                Some("private-secret"),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        searched["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let fetched = json_body(
+        app.oneshot(request(
+            "tools/call",
+            json!({"name": "fetch", "arguments": {"id": id}, "_meta": request_meta()}),
+            Some("private-secret"),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(fetched["result"]["isError"], true);
+    assert_eq!(fetched["result"]["structuredContent"]["error"], "not_found");
+}
+
+#[tokio::test]
+async fn unavailable_inbox_costs_only_the_write_tool() {
+    for adjust in [
+        |config: &mut Config| config.inbox = None,
+        |config: &mut Config| {
+            config.inbox.as_mut().unwrap().root = config.kb_root.join("absent-inbox");
+        },
+    ] {
+        let (_root, app) = app_with(20, adjust);
+        let listed = json_body(
+            app.clone()
+                .oneshot(request(
+                    "tools/list",
+                    json!({"_meta": request_meta()}),
+                    Some("private-secret"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 2);
+
+        let denied = json_body(
+            app.clone()
+                .oneshot(append("Note", "body", "private-secret"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(denied["error"]["message"], "tool not found");
+
+        let fetched = json_body(
+            app.oneshot(request(
+                "tools/call",
+                json!({
+                    "name": "fetch",
+                    "arguments": {"id": "10_tech/rust/needle.md"},
+                    "_meta": request_meta(),
+                }),
+                Some("private-secret"),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            fetched["result"]["structuredContent"]["title"],
+            "Public needle"
+        );
     }
 }
 

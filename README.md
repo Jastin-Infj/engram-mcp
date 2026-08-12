@@ -2,12 +2,14 @@
 
 [日本語版](README.ja.md)
 
-`engram-mcp` exposes a local Markdown knowledge base as a small, read-only
+`engram-mcp` exposes a local Markdown knowledge base as a small
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server. It
-offers only two tools:
+offers two read tools and one narrowly scoped write tool:
 
 - `search` finds Markdown documents visible to the caller.
 - `fetch` returns one visible Markdown document by its relative ID.
+- `append_note` creates one new Markdown file in `99_inbox/`. It is listed only
+  to a `kb:private` client while a writable inbox is configured.
 
 The server is designed for self-hosting behind an HTTPS reverse proxy or a
 Cloudflare Tunnel. It implements OAuth 2.1 Authorization Code + PKCE and can
@@ -18,10 +20,10 @@ your server secrets.
 
 The fixed OAuth scopes are deliberately simple:
 
-| Scope | Visible content |
-| --- | --- |
-| `kb:tech` | `INDEX.md` plus `KB_PUBLIC_DIRS` |
-| `kb:private` | Everything visible to `kb:tech`, plus `KB_PRIVATE_DIRS` |
+| Scope | Visible content | Inbox write |
+| --- | --- | --- |
+| `kb:tech` | `INDEX.md` plus `KB_PUBLIC_DIRS` | No |
+| `kb:private` | Everything visible to `kb:tech`, plus `KB_PRIVATE_DIRS` | `append_note`, when the inbox is available |
 
 The defaults preserve the sample layout:
 
@@ -36,9 +38,12 @@ handled as `not_found`; `search` does not enumerate out-of-scope directories.
 
 ## Security model
 
-- There are no write tools, document HTTP endpoints, resources, or prompts.
+- The only write tool is `append_note`: it accepts a title and Markdown body,
+  never a file name or path, and creates one new file under `99_inbox/`. It
+  cannot edit, overwrite, delete, search, or fetch inbox notes.
 - The container runs as a non-root user with a read-only root filesystem. The
-  knowledge-base bind mount is read-only.
+  knowledge-base bind mount is read-only. The inbox is a distinct writable
+  mount, not a writable subtree under `/kb`.
 - On Linux, document reads use `openat2` with `RESOLVE_BENEATH`,
   `RESOLVE_NO_SYMLINKS`, and `RESOLVE_NO_MAGICLINKS`; traversal paths,
   symlinks, special files, and non-Markdown IDs are rejected.
@@ -52,7 +57,8 @@ handled as `not_found`; `search` does not enumerate out-of-scope directories.
   expiry, and revocation flag in the `oauth_state` named volume. Token plaintext
   and client secrets are not stored there.
 - Access logs use derived credential fingerprints and never log API keys,
-  bearer tokens, authorization codes, or document queries.
+  bearer tokens, authorization codes, document queries, note titles, or note
+  bodies.
 
 ## Architecture
 
@@ -64,6 +70,7 @@ Cloudflare Tunnel or reverse proxy
   ▼
 cloudflared (optional) ── internal Docker network ── engram-mcp
                                                     ├─ /kb (read-only Markdown)
+                                                    ├─ /inbox (new notes only)
                                                     └─ /state (refresh-family state only)
 ```
 
@@ -79,6 +86,8 @@ contents are returned only through MCP tool results.
 Create a directory with `INDEX.md` and the top-level directories you configured.
 For the defaults, that means `10_tech/`, `20_projects/`, and `90_private/`.
 Only Markdown files in those configured directories are searchable or fetchable.
+Create a separate `99_inbox/` directory if you want clients with `kb:private`
+to file notes. Inbox notes intentionally stay outside the readable directories.
 
 ### 2. Generate independent secrets
 
@@ -111,10 +120,14 @@ Edit `.env` yourself. At minimum, replace all dummy secrets and set:
 - `MCP_ALLOWED_HOSTS` to the public hostname and `engram-mcp:8080`.
 - `KB_PUBLIC_DIRS` and `KB_PRIVATE_DIRS` if the default layout does not match
   your knowledge base.
+- `INBOX_ROOT` to the existing `99_inbox` directory if you run with `cargo run`.
+  In Compose, ensure `${KB_HOST_PATH}/99_inbox` exists and is writable by the
+  container user; Compose mounts it at `/inbox` separately from `/kb`.
 
 For local `cargo run`, also set `KB_ROOT` and an absolute, writable
-`OAUTH_STATE_DIR`. Docker Compose sets `KB_ROOT=/kb` and `OAUTH_STATE_DIR=/state`
-for you.
+`OAUTH_STATE_DIR`. Docker Compose sets `KB_ROOT=/kb`, `INBOX_ROOT=/inbox`, and
+`OAUTH_STATE_DIR=/state` for you. Set `INBOX_CONTAINER_PATH=` (empty) in `.env`
+to disable the write tool in Compose without affecting reads.
 
 ### 4. Start the service
 
@@ -163,9 +176,11 @@ PKCE S256, and the two OAuth grants required for the flow.
 
 In the current ChatGPT connector-management UI, add a custom MCP server and
 enter your canonical MCP URL, for example `https://kb.example.com/mcp`. Follow
-the OAuth sign-in prompt and approve only the scope you intend to grant;
-normally this is `kb:tech`. ChatGPT discovers the protected-resource and OAuth
-metadata, may dynamically register a client, and completes PKCE automatically.
+the OAuth sign-in prompt and approve only the scope you intend to grant. Choose
+`kb:private` when you want ChatGPT to file a conversation summary or other
+Markdown note with `append_note`; choose `kb:tech` for read-only access. ChatGPT
+discovers the protected-resource and OAuth metadata, may dynamically register a
+client, and completes PKCE automatically.
 
 The exact UI and account availability can change. Verify the shown redirect URI
 and use the server's consent page rather than supplying the owner secret or
@@ -180,6 +195,30 @@ Create a custom remote MCP connector in Claude, provide the same canonical
 directories; otherwise select `kb:tech`. If the connector uses dynamic client
 registration, let it complete DCR and do not copy server secrets into its
 client-ID or client-secret fields.
+
+## Inbox notes
+
+`append_note` is intentionally append-only. A successful call returns an ID
+such as `99_inbox/2026-08-13-034500-project-summary.md`, creation time, and byte
+count. The server generates the UTC file name and YAML front matter (`title`,
+`created`, `source`, and a non-secret audit fingerprint), then creates the file
+with `O_CREAT | O_EXCL` under a Linux `openat2` resolution rooted at the inbox.
+An existing file is never opened for writing.
+
+- Note bodies are capped at 32 KiB by default; the flat inbox total is capped at 8
+  MiB; writes use a separate shared 10-per-hour budget. Adjust these with
+  `INBOX_MAX_NOTE_BYTES`, `INBOX_MAX_TOTAL_BYTES`, and
+  `INBOX_WRITES_PER_HOUR`.
+- If the inbox is unset, missing, read-only, or otherwise unusable, the server
+  continues to serve `search` and `fetch`; it simply does not list
+  `append_note`.
+- Treat everything in `99_inbox/` as untrusted input. A chat can be influenced
+  by prompt injection even though it cannot alter the canonical KB through this
+  server. Review and sort inbox notes before moving their contents elsewhere.
+
+See the [implementation handoff](docs/features/inbox/implementation.md) and
+[test plan](docs/features/inbox/test_plan.md) for configuration and validation
+details.
 
 ## Token expiry and revocation
 

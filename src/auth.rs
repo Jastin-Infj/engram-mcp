@@ -207,6 +207,26 @@ struct Bucket {
     updated_at: Instant,
 }
 
+impl Bucket {
+    fn full(capacity: f64, now: Instant) -> Self {
+        Self {
+            tokens: capacity,
+            updated_at: now,
+        }
+    }
+
+    fn take(&mut self, capacity: f64, refill_per_second: f64, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.updated_at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * refill_per_second).min(capacity);
+        self.updated_at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("rate limit exceeded")]
 pub struct RateLimitError;
@@ -223,19 +243,58 @@ impl RateLimiter {
     pub fn check(&self, subject: AuthSubject) -> Result<(), RateLimitError> {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
-        let bucket = buckets.entry(subject.credential_id).or_insert(Bucket {
-            tokens: self.capacity,
-            updated_at: now,
-        });
-        let elapsed = now.duration_since(bucket.updated_at).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_second).min(self.capacity);
-        bucket.updated_at = now;
-
-        if bucket.tokens < 1.0 {
-            return Err(RateLimitError);
+        let bucket = buckets
+            .entry(subject.credential_id)
+            .or_insert_with(|| Bucket::full(self.capacity, now));
+        if bucket.take(self.capacity, self.refill_per_second, now) {
+            Ok(())
+        } else {
+            Err(RateLimitError)
         }
-        bucket.tokens -= 1.0;
-        Ok(())
+    }
+}
+
+/// The budget for note writes, deliberately kept as one bucket for the whole
+/// server rather than one per credential.
+///
+/// An OAuth `CredentialId` is derived from the access token, so it changes on
+/// every refresh; a per-credential write budget would reset itself every time a
+/// client rotated its token. The knowledge base has a single owner, so one
+/// shared hourly budget is both the honest limit and the one a client cannot
+/// escape. Reads keep using the per-credential [`RateLimiter`].
+#[derive(Clone)]
+pub struct WriteRateLimiter {
+    capacity: f64,
+    refill_per_second: f64,
+    bucket: Arc<Mutex<Bucket>>,
+}
+
+impl std::fmt::Debug for WriteRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteRateLimiter")
+            .field("writes_per_hour", &self.capacity)
+            .finish()
+    }
+}
+
+impl WriteRateLimiter {
+    pub fn new(writes_per_hour: u32) -> Self {
+        let capacity = f64::from(writes_per_hour);
+        Self {
+            capacity,
+            refill_per_second: capacity / 3_600.0,
+            bucket: Arc::new(Mutex::new(Bucket::full(capacity, Instant::now()))),
+        }
+    }
+
+    pub fn check(&self) -> Result<(), RateLimitError> {
+        let now = Instant::now();
+        let mut bucket = self.bucket.lock().expect("write limiter mutex poisoned");
+        if bucket.take(self.capacity, self.refill_per_second, now) {
+            Ok(())
+        } else {
+            Err(RateLimitError)
+        }
     }
 }
 
@@ -312,5 +371,15 @@ mod tests {
         assert!(limiter.check(subject).is_ok());
         assert!(limiter.check(subject).is_ok());
         assert_eq!(limiter.check(subject), Err(RateLimitError));
+    }
+
+    #[test]
+    fn write_limiter_is_shared_and_cannot_be_reset_by_rotating_credentials() {
+        let limiter = WriteRateLimiter::new(2);
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_ok());
+        assert_eq!(limiter.check(), Err(RateLimitError));
+        // A clone is the same bucket: cloning happens per MCP connection.
+        assert_eq!(limiter.clone().check(), Err(RateLimitError));
     }
 }

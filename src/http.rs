@@ -23,9 +23,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
     audit::{self, AuditContext},
-    auth::{Authenticator, RateLimiter},
+    auth::{Authenticator, RateLimiter, WriteRateLimiter},
     config::Config,
     document::{DocumentStore, StoreError},
+    inbox::{INBOX_ID_PREFIX, InboxStore},
     oauth::{
         ApprovalForm, AuthorizationQuery, AuthorizationRedirect, OAuthError, OAuthService,
         RegistrationRequest, SCOPE_PRIVATE, SCOPE_TECH, TokenRequest,
@@ -59,7 +60,7 @@ pub fn router(config: &Config) -> Result<Router, RouterError> {
         config.max_search_file_bytes,
         config.scope_directories.clone(),
     )?;
-    let server = KnowledgeBaseServer::new(store, config.max_search_response_bytes);
+    let server = KnowledgeBaseServer::new(store, config.max_search_response_bytes, inbox(config));
     let transport_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(config.allowed_hosts.iter().cloned())
         .with_allowed_origins(config.allowed_origins.iter().cloned())
@@ -118,6 +119,37 @@ pub fn router(config: &Config) -> Result<Router, RouterError> {
         .route("/healthz", get(healthz))
         .merge(protected)
         .fallback(not_found))
+}
+
+/// Opens the note inbox, or reports why the server will run without one.
+///
+/// An inbox that cannot be opened is never fatal. Reading the knowledge base is
+/// the service's reason to exist and does not depend on this mount, so a missing
+/// or read-only inbox costs one tool and nothing else.
+fn inbox(config: &Config) -> Option<(InboxStore, WriteRateLimiter)> {
+    let settings = config.inbox.as_ref()?;
+    match InboxStore::open(
+        &settings.root,
+        &config.kb_root,
+        settings.max_note_bytes,
+        settings.max_total_bytes,
+    ) {
+        Ok(store) => {
+            tracing::info!(
+                inbox_id_prefix = INBOX_ID_PREFIX,
+                writes_per_hour = settings.writes_per_hour,
+                "note inbox is writable; append_note is available to the private scope"
+            );
+            Some((store, WriteRateLimiter::new(settings.writes_per_hour)))
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "note inbox is unavailable; serving search and fetch without append_note"
+            );
+            None
+        }
+    }
 }
 
 async fn healthz() -> StatusCode {

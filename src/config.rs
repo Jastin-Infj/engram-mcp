@@ -7,6 +7,8 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+use crate::inbox::INBOX_ID_PREFIX;
+
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_READ_BYTES: usize = 65_536;
 const DEFAULT_MAX_SEARCH_RESPONSE_BYTES: usize = 24_576;
@@ -16,6 +18,9 @@ const DEFAULT_RATE_LIMIT_BURST: u32 = 10;
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS: u64 = 900;
 const DEFAULT_OAUTH_AUTHORIZATION_CODE_TTL_SECONDS: u64 = 300;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS: u64 = 1_209_600;
+const DEFAULT_INBOX_WRITES_PER_HOUR: u32 = 10;
+const DEFAULT_INBOX_MAX_NOTE_BYTES: usize = 32_768;
+const DEFAULT_INBOX_MAX_TOTAL_BYTES: u64 = 8_388_608;
 const DEFAULT_KB_PUBLIC_DIRS: &[&str] = &["10_tech", "20_projects"];
 const DEFAULT_KB_PRIVATE_DIRS: &[&str] = &["90_private"];
 
@@ -47,6 +52,13 @@ impl ScopeDirectories {
         }
         if public.iter().any(|directory| private.contains(directory)) {
             return Err(ConfigError::OverlappingScopeDirectories);
+        }
+        // The inbox is write-only by contract: append_note promises callers the
+        // note "cannot be read back through search or fetch", and unsorted
+        // notes are untrusted input that must not flow into chat reads. Serving
+        // the inbox directory would break both, so it cannot be a scope.
+        if public.contains(INBOX_ID_PREFIX) || private.contains(INBOX_ID_PREFIX) {
+            return Err(ConfigError::InboxDirectoryInScope);
         }
         Ok(Self { public, private })
     }
@@ -98,6 +110,22 @@ pub struct Config {
     pub rate_limit_per_minute: u32,
     pub rate_limit_burst: u32,
     pub oauth: OAuthConfig,
+    /// `None` disables `append_note` outright: the server then has no writable
+    /// surface at all, exactly as it did before the tool existed.
+    pub inbox: Option<InboxConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InboxConfig {
+    /// Absolute path of the knowledge base's `99_inbox` directory as this
+    /// process sees it. Compose mounts it separately from the read-only `/kb`.
+    pub root: PathBuf,
+    pub writes_per_hour: u32,
+    /// Per-note limit on the client-supplied body. The transport's 32 KiB
+    /// request-body cap rejects anything larger first, so this is the limit
+    /// that holds for any future transport rather than the one usually hit.
+    pub max_note_bytes: usize,
+    pub max_total_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -186,6 +214,7 @@ impl std::fmt::Debug for Config {
             .field("rate_limit_per_minute", &self.rate_limit_per_minute)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("oauth", &self.oauth)
+            .field("inbox", &self.inbox)
             .finish()
     }
 }
@@ -204,6 +233,8 @@ pub enum ConfigError {
     InvalidScopeDirectories(&'static str),
     #[error("KB_PUBLIC_DIRS and KB_PRIVATE_DIRS must not overlap")]
     OverlappingScopeDirectories,
+    #[error("the write-only inbox directory (99_inbox) cannot be served as a scope")]
+    InboxDirectoryInScope,
     #[error("invalid socket address in MCP_BIND_ADDR")]
     InvalidBindAddress,
     #[error("invalid integer in {0}")]
@@ -220,6 +251,8 @@ pub enum ConfigError {
     WeakSecret(&'static str),
     #[error("OAUTH_STATE_DIR must be an absolute writable directory path")]
     InvalidOAuthStateDir,
+    #[error("INBOX_ROOT must be an absolute directory path")]
+    InvalidInboxRoot,
 }
 
 impl Config {
@@ -326,6 +359,41 @@ impl Config {
         };
         oauth.validate()?;
 
+        // Leaving INBOX_ROOT unset is the supported way to run without a write
+        // tool, so an absent value is not an error.
+        let inbox = optional(&lookup, "INBOX_ROOT")
+            .map(|root| {
+                let root = PathBuf::from(root);
+                if !root.is_absolute() {
+                    return Err(ConfigError::InvalidInboxRoot);
+                }
+                Ok(InboxConfig {
+                    root,
+                    writes_per_hour: parse_u32(
+                        &lookup,
+                        "INBOX_WRITES_PER_HOUR",
+                        DEFAULT_INBOX_WRITES_PER_HOUR,
+                        1,
+                        100,
+                    )?,
+                    max_note_bytes: parse_usize(
+                        &lookup,
+                        "INBOX_MAX_NOTE_BYTES",
+                        DEFAULT_INBOX_MAX_NOTE_BYTES,
+                        1_024,
+                        DEFAULT_INBOX_MAX_NOTE_BYTES,
+                    )?,
+                    max_total_bytes: parse_u64(
+                        &lookup,
+                        "INBOX_MAX_TOTAL_BYTES",
+                        DEFAULT_INBOX_MAX_TOTAL_BYTES,
+                        65_536,
+                        67_108_864,
+                    )?,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             kb_root,
             scope_directories,
@@ -340,6 +408,7 @@ impl Config {
             rate_limit_per_minute,
             rate_limit_burst,
             oauth,
+            inbox,
         })
     }
 }
@@ -542,6 +611,7 @@ mod tests {
         assert!(config.scope_directories.allows_public("10_tech"));
         assert!(config.scope_directories.allows_public("20_projects"));
         assert!(config.scope_directories.allows_private("90_private"));
+        assert!(config.inbox.is_none());
     }
 
     #[test]
@@ -574,6 +644,21 @@ mod tests {
             Err(ConfigError::OverlappingScopeDirectories)
         ));
 
+        // The write-only inbox must never be servable, from either scope.
+        for key in ["KB_PUBLIC_DIRS", "KB_PRIVATE_DIRS"] {
+            let mut source = source.clone();
+            source.insert("KB_PUBLIC_DIRS".into(), "notes".into());
+            source.insert("KB_PRIVATE_DIRS".into(), "private".into());
+            source.insert(
+                key.into(),
+                format!("notes2,{}", crate::inbox::INBOX_ID_PREFIX),
+            );
+            assert!(matches!(
+                Config::from_lookup(|key| source.get(key).cloned()),
+                Err(ConfigError::InboxDirectoryInScope)
+            ));
+        }
+
         assert!(matches!(
             ScopeDirectories::new(
                 BTreeSet::from(["../outside".to_owned()]),
@@ -591,6 +676,41 @@ mod tests {
         assert!(matches!(
             Config::from_lookup(|key| source.get(key).cloned()),
             Err(ConfigError::OutOfRange("MAX_SEARCH_RESPONSE_BYTES"))
+        ));
+    }
+
+    #[test]
+    fn applies_inbox_defaults_and_rejects_a_relative_root() {
+        let root = TempDir::new().unwrap();
+        let mut source = values(&root);
+        source.insert(
+            "INBOX_ROOT".into(),
+            root.path().join("99_inbox").display().to_string(),
+        );
+        let inbox = Config::from_lookup(|key| source.get(key).cloned())
+            .unwrap()
+            .inbox
+            .unwrap();
+        assert_eq!(inbox.writes_per_hour, DEFAULT_INBOX_WRITES_PER_HOUR);
+        assert_eq!(inbox.max_note_bytes, DEFAULT_INBOX_MAX_NOTE_BYTES);
+        assert_eq!(inbox.max_total_bytes, DEFAULT_INBOX_MAX_TOTAL_BYTES);
+
+        source.insert("INBOX_ROOT".into(), "relative/99_inbox".into());
+        assert!(matches!(
+            Config::from_lookup(|key| source.get(key).cloned()),
+            Err(ConfigError::InvalidInboxRoot)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_inbox_note_limit_above_the_request_body_cap() {
+        let root = TempDir::new().unwrap();
+        let mut source = values(&root);
+        source.insert("INBOX_ROOT".into(), "/inbox".into());
+        source.insert("INBOX_MAX_NOTE_BYTES".into(), "65536".into());
+        assert!(matches!(
+            Config::from_lookup(|key| source.get(key).cloned()),
+            Err(ConfigError::OutOfRange("INBOX_MAX_NOTE_BYTES"))
         ));
     }
 }

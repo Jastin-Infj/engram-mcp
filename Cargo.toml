@@ -3,7 +3,7 @@ name = "engram-mcp"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Read-only OAuth 2.1 MCP server for a local Markdown knowledge base"
+description = "OAuth 2.1 MCP server for a local Markdown knowledge base with scoped inbox note creation"
 license = "MIT"
 
 [dependencies]

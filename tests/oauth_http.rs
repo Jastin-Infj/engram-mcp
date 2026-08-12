@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use engram_mcp::{
-    config::{Config, OAuthConfig, ScopeDirectories},
+    config::{Config, InboxConfig, OAuthConfig, ScopeDirectories},
     http,
 };
 use serde_json::{Value, json};
@@ -67,6 +67,8 @@ fn test_config(
             refresh_state_dir: root.path().join("oauth-state"),
             refresh_token_ttl_seconds,
         },
+        // OAuth contract tests do not need a writable surface.
+        inbox: None,
     }
 }
 
@@ -82,6 +84,21 @@ fn app_with_ttls(
 
 fn app(access_token_ttl_seconds: u64) -> (TempDir, Router) {
     app_with_ttls(access_token_ttl_seconds, 60)
+}
+
+fn app_with_inbox(access_token_ttl_seconds: u64) -> (TempDir, Router) {
+    let root = TempDir::new().unwrap();
+    prepare_kb(&root);
+    let inbox = root.path().join("99_inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let mut config = test_config(&root, access_token_ttl_seconds, 60);
+    config.inbox = Some(InboxConfig {
+        root: inbox,
+        writes_per_hour: 10,
+        max_note_bytes: 32_768,
+        max_total_bytes: 8_388_608,
+    });
+    (root, http::router(&config).unwrap())
 }
 
 async fn json_body(response: axum::response::Response) -> Value {
@@ -313,6 +330,37 @@ fn mcp_request(api_key: Option<&str>, bearer: Option<&str>, id: &str) -> Request
         .unwrap()
 }
 
+fn append_note_request(bearer: &str, title: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::HOST, "engram.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "append_note")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "append_note",
+                    "arguments": {"title": title, "body": body},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {"name": "oauth-test", "version": "1.0"},
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                },
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn oauth_metadata_endpoints_advertise_mcp_oauth_contract() {
     let (_root, app) = app(60);
@@ -438,6 +486,33 @@ async fn kb_tech_bearer_token_hides_private_documents_and_api_keys_still_work() 
         json_body(api_key_response).await["result"]["structuredContent"]["title"],
         "Public needle"
     );
+}
+
+#[tokio::test]
+async fn kb_private_bearer_token_can_append_an_inbox_note() {
+    let (root, app) = app_with_inbox(60);
+    let client_id = register_public_client(app.clone()).await;
+    let code = authorize(app.clone(), &client_id, "kb:private").await;
+    let token = json_body(exchange_code(app.clone(), &client_id, &code, PKCE_VERIFIER).await).await;
+    let access_token = token["access_token"].as_str().unwrap();
+    assert_eq!(token["scope"], "kb:private");
+
+    let response = app
+        .oneshot(append_note_request(
+            access_token,
+            "Chat handoff",
+            "Captured through OAuth",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = json_body(response).await["result"]["structuredContent"].clone();
+    let id = result["id"].as_str().unwrap();
+    assert!(id.starts_with("99_inbox/"));
+    let file_name = id.strip_prefix("99_inbox/").unwrap();
+    let stored = std::fs::read_to_string(root.path().join("99_inbox").join(file_name)).unwrap();
+    assert!(stored.contains("title: Chat handoff"));
+    assert!(stored.ends_with("Captured through OAuth\n"));
 }
 
 #[tokio::test]
