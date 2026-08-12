@@ -1,0 +1,13 @@
+# Local secrets and runtime state
+.env
+.env.keys
+.oauth-state/
+
+# Rust build artifacts
+target/
+
+# Editor and operating-system metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+*:Zone.Identifier

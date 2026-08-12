@@ -1,0 +1,116 @@
+name: engram-mcp
+
+services:
+  engram-mcp:
+    image: engram-mcp-oss-runtime:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      KB_ROOT: /kb
+      MCP_BIND_ADDR: 0.0.0.0:8080
+      KB_KEY_A: ${KB_KEY_A:?Set KB_KEY_A in .env}
+      KB_KEY_B: ${KB_KEY_B:?Set KB_KEY_B in .env}
+      KB_PUBLIC_DIRS: ${KB_PUBLIC_DIRS:-10_tech,20_projects}
+      KB_PRIVATE_DIRS: ${KB_PRIVATE_DIRS:-90_private}
+      OAUTH_ISSUER: ${OAUTH_ISSUER:?Set OAUTH_ISSUER in .env}
+      OAUTH_RESOURCE: ${OAUTH_RESOURCE:?Set OAUTH_RESOURCE in .env}
+      OAUTH_OWNER_SECRET: ${OAUTH_OWNER_SECRET:?Set OAUTH_OWNER_SECRET in .env}
+      OAUTH_SIGNING_KEY: ${OAUTH_SIGNING_KEY:?Set OAUTH_SIGNING_KEY in .env}
+      OAUTH_ACCESS_TOKEN_TTL_SECONDS: ${OAUTH_ACCESS_TOKEN_TTL_SECONDS:-900}
+      OAUTH_AUTHORIZATION_CODE_TTL_SECONDS: ${OAUTH_AUTHORIZATION_CODE_TTL_SECONDS:-300}
+      OAUTH_REFRESH_TOKEN_TTL_SECONDS: ${OAUTH_REFRESH_TOKEN_TTL_SECONDS:-1209600}
+      OAUTH_STATE_DIR: /state
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:?Set MCP_ALLOWED_HOSTS in .env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      MAX_READ_BYTES: ${MAX_READ_BYTES:-65536}
+      MAX_SEARCH_RESPONSE_BYTES: ${MAX_SEARCH_RESPONSE_BYTES:-24576}
+      MAX_SEARCH_FILE_BYTES: ${MAX_SEARCH_FILE_BYTES:-1048576}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ${KB_HOST_PATH:-./knowledge-base}:/kb:ro
+      - oauth_state:/state
+    depends_on:
+      oauth-state-init:
+        condition: service_completed_successfully
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - mcp_internal
+
+  # This one-shot root process initializes only the refresh-state volume.
+  # The application itself stays non-root with a read-only root filesystem.
+  oauth-state-init:
+    image: engram-mcp-oss-runtime:local
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["mkdir -p /state && chown 10001:10001 /state && chmod 0700 /state"]
+    volumes:
+      - oauth_state:/state
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 16
+    network_mode: none
+    restart: "no"
+
+  # Optional: start this service only after setting TUNNEL_TOKEN in .env.
+  cloudflared:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:2026.7.3
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set TUNNEL_TOKEN in .env before enabling the tunnel}
+    depends_on:
+      engram-mcp:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    restart: unless-stopped
+    networks:
+      - mcp_internal
+      - edge
+
+networks:
+  mcp_internal:
+    internal: true
+  edge: {}
+
+volumes:
+  oauth_state: {}

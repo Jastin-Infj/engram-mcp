@@ -1,0 +1,10 @@
+.env
+.git
+.gitignore
+target
+tests
+docs
+*.md
+*:Zone.Identifier
+Thumbs.db
+desktop.ini
