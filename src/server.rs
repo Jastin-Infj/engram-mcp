@@ -80,6 +80,10 @@ struct AppendNoteArguments {
     title: String,
     /// The note itself, stored verbatim as Markdown.
     body: String,
+    /// The date (YYYY-MM-DD) the conversation or event described by the note
+    /// happened. Always provide it: the server records only the filing time,
+    /// so without this an old topic looks current when the note is sorted.
+    occurred: Option<String>,
 }
 
 impl KnowledgeBaseServer {
@@ -183,7 +187,7 @@ impl KnowledgeBaseServer {
 
     #[tool(
         name = "append_note",
-        description = "File a new note in the knowledge base inbox for the owner to sort later. The server assigns the file name and adds the front matter; the note cannot be edited, replaced, or read back through search or fetch, and no existing document can be changed.",
+        description = "File a new note in the knowledge base inbox for the owner to sort later. Always set occurred to the date (YYYY-MM-DD) the conversation or event happened, and mention it in the body too — the server only records the filing time, so an undated note about an old topic would be mistaken for current information. The server assigns the file name and adds the front matter; the note cannot be edited, replaced, or read back through search or fetch, and no existing document can be changed.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -214,6 +218,7 @@ impl KnowledgeBaseServer {
         let error = match inbox.store.create_note(
             &arguments.title,
             &arguments.body,
+            arguments.occurred.as_deref(),
             audit_context.credential_fingerprint.as_ref(),
             SystemTime::now(),
         ) {
@@ -241,6 +246,13 @@ impl KnowledgeBaseServer {
             InboxError::InvalidBody => (
                 "invalid_body",
                 Err(ErrorData::invalid_params("invalid note body", None)),
+            ),
+            InboxError::InvalidOccurred => (
+                "invalid_occurred",
+                Err(ErrorData::invalid_params(
+                    "invalid occurred date; use YYYY-MM-DD",
+                    None,
+                )),
             ),
             InboxError::NoteTooLarge => (
                 "note_too_large",

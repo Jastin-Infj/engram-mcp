@@ -43,6 +43,8 @@ pub enum InboxError {
     InvalidTitle,
     #[error("note body is invalid")]
     InvalidBody,
+    #[error("occurred date is invalid; use YYYY-MM-DD")]
+    InvalidOccurred,
     #[error("note is larger than the per-note limit")]
     NoteTooLarge,
     #[error("inbox storage quota is exhausted")]
@@ -133,15 +135,17 @@ impl InboxStore {
         &self,
         title: &str,
         body: &str,
+        occurred: Option<&str>,
         fingerprint: &str,
         now: SystemTime,
     ) -> Result<CreatedNote, InboxError> {
         let title = normalize_title(title)?;
         validate_body(body, self.max_note_bytes)?;
+        let occurred = occurred.map(validate_occurred).transpose()?;
 
         let seconds = unix_seconds(now);
         let created = rfc3339_utc(seconds);
-        let contents = render_note(&title, &created, fingerprint, body)?;
+        let contents = render_note(&title, &created, occurred, fingerprint, body)?;
         let size = contents.len() as u64;
 
         let used = self.used_bytes()?;
@@ -281,6 +285,27 @@ fn normalize_title(title: &str) -> Result<String, InboxError> {
     Ok(title.to_owned())
 }
 
+/// `YYYY-MM-DD` only. A malformed date is rejected rather than stored, so the
+/// field can be trusted by whatever sorts the inbox later.
+fn validate_occurred(value: &str) -> Result<&str, InboxError> {
+    let bytes = value.as_bytes();
+    let well_formed = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|&i| bytes[i].is_ascii_digit());
+    if !well_formed {
+        return Err(InboxError::InvalidOccurred);
+    }
+    let month = value[5..7].parse::<u32>().unwrap_or(0);
+    let day = value[8..10].parse::<u32>().unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(InboxError::InvalidOccurred);
+    }
+    Ok(value)
+}
+
 fn validate_body(body: &str, max_note_bytes: usize) -> Result<(), InboxError> {
     if body.trim().is_empty() || body.contains('\0') {
         return Err(InboxError::InvalidBody);
@@ -295,6 +320,10 @@ fn validate_body(body: &str, max_note_bytes: usize) -> Result<(), InboxError> {
 struct NoteFrontMatter<'a> {
     title: &'a str,
     created: &'a str,
+    /// The date the conversation or event happened, as told by the caller.
+    /// Distinct from `created`: a note filed today can describe last month.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occurred: Option<&'a str>,
     source: &'a str,
     fingerprint: &'a str,
 }
@@ -306,12 +335,14 @@ struct NoteFrontMatter<'a> {
 fn render_note(
     title: &str,
     created: &str,
+    occurred: Option<&str>,
     fingerprint: &str,
     body: &str,
 ) -> Result<String, InboxError> {
     let front_matter = serde_yaml::to_string(&NoteFrontMatter {
         title,
         created,
+        occurred,
         source: NOTE_SOURCE,
         fingerprint,
     })
@@ -502,7 +533,7 @@ mod tests {
         ));
 
         let title = "a: b --- \"quoted\" #hash 所有権";
-        let note = render_note(title, "2026-08-13T03:45:00Z", FINGERPRINT, "body\n").unwrap();
+        let note = render_note(title, "2026-08-13T03:45:00Z", None, FINGERPRINT, "body\n").unwrap();
         let rest = note.strip_prefix("---\n").unwrap();
         let end = rest.find("\n---\n").unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&rest[..end]).unwrap();
@@ -515,7 +546,7 @@ mod tests {
     #[test]
     fn a_body_that_starts_with_front_matter_stays_body() {
         let body = "---\ntitle: Forged\nsource: trusted\n---\n\nreal body\n";
-        let note = render_note("Real", "2026-08-13T03:45:00Z", FINGERPRINT, body).unwrap();
+        let note = render_note("Real", "2026-08-13T03:45:00Z", None, FINGERPRINT, body).unwrap();
         let rest = note.strip_prefix("---\n").unwrap();
         let end = rest.find("\n---\n").unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&rest[..end]).unwrap();
@@ -528,7 +559,13 @@ mod tests {
     fn writes_a_note_with_a_generated_name() {
         let (_kb, store) = store();
         let note = store
-            .create_note("Rust Notes", "body text", FINGERPRINT, at(SAMPLE_TIME))
+            .create_note(
+                "Rust Notes",
+                "body text",
+                None,
+                FINGERPRINT,
+                at(SAMPLE_TIME),
+            )
             .unwrap();
         assert_eq!(note.id, "99_inbox/2026-08-13-034500-rust-notes.md");
         assert_eq!(note.created, "2026-08-13T03:45:00Z");
@@ -545,10 +582,10 @@ mod tests {
     fn a_name_collision_never_overwrites() {
         let (_kb, store) = store();
         let first = store
-            .create_note("Same Title", "first", FINGERPRINT, at(SAMPLE_TIME))
+            .create_note("Same Title", "first", None, FINGERPRINT, at(SAMPLE_TIME))
             .unwrap();
         let second = store
-            .create_note("Same Title", "second", FINGERPRINT, at(SAMPLE_TIME))
+            .create_note("Same Title", "second", None, FINGERPRINT, at(SAMPLE_TIME))
             .unwrap();
         assert_eq!(first.id, "99_inbox/2026-08-13-034500-same-title.md");
         assert_eq!(second.id, "99_inbox/2026-08-13-034500-same-title-2.md");
@@ -568,7 +605,7 @@ mod tests {
             fs::write(store.root.join(&name), "existing").unwrap();
         }
         assert!(matches!(
-            store.create_note("Same Title", "body", FINGERPRINT, at(SAMPLE_TIME)),
+            store.create_note("Same Title", "body", None, FINGERPRINT, at(SAMPLE_TIME)),
             Err(InboxError::NameExhausted)
         ));
         // Every pre-existing file is still exactly as it was.
@@ -590,7 +627,7 @@ mod tests {
         let target = kb.path().join("captured.md");
         symlink(&target, store.root.join("2026-08-13-034500-same-title.md")).unwrap();
         let note = store
-            .create_note("Same Title", "body", FINGERPRINT, at(SAMPLE_TIME))
+            .create_note("Same Title", "body", None, FINGERPRINT, at(SAMPLE_TIME))
             .unwrap();
         assert_eq!(note.id, "99_inbox/2026-08-13-034500-same-title-2.md");
         assert!(!target.exists());
@@ -601,13 +638,13 @@ mod tests {
         let (_kb, store) = store();
         for title in ["", "   ", "line\nbreak", &"x".repeat(201)] {
             assert!(matches!(
-                store.create_note(title, "body", FINGERPRINT, at(SAMPLE_TIME)),
+                store.create_note(title, "body", None, FINGERPRINT, at(SAMPLE_TIME)),
                 Err(InboxError::InvalidTitle)
             ));
         }
         for body in ["", "  \n ", "nul\0byte"] {
             assert!(matches!(
-                store.create_note("Title", body, FINGERPRINT, at(SAMPLE_TIME)),
+                store.create_note("Title", body, None, FINGERPRINT, at(SAMPLE_TIME)),
                 Err(InboxError::InvalidBody)
             ));
         }
@@ -620,12 +657,12 @@ mod tests {
         fs::create_dir_all(&inbox).unwrap();
         let store = InboxStore::open(&inbox, kb.path(), 64, 1_048_576).unwrap();
         assert!(matches!(
-            store.create_note("Title", &"x".repeat(65), FINGERPRINT, at(SAMPLE_TIME)),
+            store.create_note("Title", &"x".repeat(65), None, FINGERPRINT, at(SAMPLE_TIME)),
             Err(InboxError::NoteTooLarge)
         ));
         assert!(
             store
-                .create_note("Title", &"x".repeat(64), FINGERPRINT, at(SAMPLE_TIME))
+                .create_note("Title", &"x".repeat(64), None, FINGERPRINT, at(SAMPLE_TIME))
                 .is_ok()
         );
     }
@@ -638,12 +675,12 @@ mod tests {
         let store = InboxStore::open(&inbox, kb.path(), 32_768, 400).unwrap();
         assert!(
             store
-                .create_note("First", "body", FINGERPRINT, at(SAMPLE_TIME))
+                .create_note("First", "body", None, FINGERPRINT, at(SAMPLE_TIME))
                 .is_ok()
         );
         fs::write(inbox.join("bulk.md"), "x".repeat(400)).unwrap();
         assert!(matches!(
-            store.create_note("Second", "body", FINGERPRINT, at(SAMPLE_TIME)),
+            store.create_note("Second", "body", None, FINGERPRINT, at(SAMPLE_TIME)),
             Err(InboxError::QuotaExceeded)
         ));
     }

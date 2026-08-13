@@ -215,7 +215,8 @@ async fn only_the_private_scope_is_offered_append_note() {
     let properties = &tools[2]["inputSchema"]["properties"];
     assert!(properties["title"].is_object());
     assert!(properties["body"].is_object());
-    assert_eq!(properties.as_object().unwrap().len(), 2);
+    assert!(properties["occurred"].is_object());
+    assert_eq!(properties.as_object().unwrap().len(), 3);
 }
 
 #[tokio::test]
